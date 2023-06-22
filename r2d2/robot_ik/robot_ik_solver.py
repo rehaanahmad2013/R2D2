@@ -7,12 +7,12 @@ from r2d2.robot_ik.arm import FrankaArm
 
 class RobotIKSolver:
     def __init__(self):
-        self.relative_max_joint_delta = np.array([0.2, 0.2, 0.2, 0.2, 0.2, 0.2, 0.2])
-        self.max_joint_delta = self.relative_max_joint_delta.max()
-        self.max_gripper_delta = 0.25
-        self.max_lin_delta = 0.075
-        self.max_rot_delta = 0.15
-        self.control_hz = 15
+		self.relative_max_joint_delta = np.array([0.2075, 0.2075, 0.2075, 0.2075, 0.251 , 0.251 , 0.251])/4
+		self.max_joint_delta = self.relative_max_joint_delta.max()
+		self.max_gripper_delta = 0.25/4
+		self.max_lin_delta = 0.125/4
+		self.max_rot_delta = 0.15/4
+		self.control_hz = 10
 
         self._arm = FrankaArm()
         self._physics = mjcf.Physics.from_mjcf_model(self._arm.mjcf_model)
