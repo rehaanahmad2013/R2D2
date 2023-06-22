@@ -16,118 +16,268 @@ from r2d2.trajectory_utils.trajectory_reader import TrajectoryReader
 from r2d2.trajectory_utils.trajectory_writer import TrajectoryWriter
 
 
-def collect_trajectory(
-    env,
-    controller=None,
-    policy=None,
-    horizon=None,
-    save_filepath=None,
-    metadata=None,
-    wait_for_controller=False,
-    obs_pointer=None,
-    save_images=False,
-    recording_folderpath=False,
-    randomize_reset=False,
-    reset_robot=True,
-):
-    """
-    Collects a robot trajectory.
-    - If policy is None, actions will come from the controller
-    - If a horizon is given, we will step the environment accordingly
-    - Otherwise, we will end the trajectory when the controller tells us to
-    - If you need a pointer to the current observation, pass a dictionary in for obs_pointer
-    """
+def collect_trajectory(env, controller=None, policy=None, horizon=None, save_folderpath=None,
+		metadata=None, wait_for_controller=False, obs_pointer=None, measure_error=False, save_np=None, save_images=False,
+		recording_folderpath=False, randomize_reset=False, reset_robot=True):
+	'''
+	Collects a robot trajectory.
+	- If policy is None, actions will come from the controller
+	- If a horizon is given, we will step the environment accordingly
+	- Otherwise, we will end the trajectory when the controller tells us to
+	- If you need a pointer to the current observation, pass a dictionary in for obs_pointer
+	- savenp will save a dict like so: ['lowdim_ee', 'actions', 'rewards', 'dones']
+	'''
+	# Check Parameters #
+	assert (controller is not None) or (policy is not None)
+	assert (controller is not None) or (horizon is not None)
+	if wait_for_controller: assert (controller is not None)
+	if obs_pointer is not None: assert isinstance(obs_pointer, dict)
+	if save_folderpath is not None:
+		save_filepath = save_folderpath + '/trajectory.h5'
+	else:
+		save_filepath = None
+	if save_images: assert save_filepath is not None
 
-    # Check Parameters #
-    assert (controller is not None) or (policy is not None)
-    assert (controller is not None) or (horizon is not None)
-    if wait_for_controller:
-        assert controller is not None
-    if obs_pointer is not None:
-        assert isinstance(obs_pointer, dict)
-    if save_images:
-        assert save_filepath is not None
+	# Reset States #
+	if controller is not None: controller.reset_state()
+	
+	# Prepare Data Writers If Necesary #
+	if save_filepath:
+		traj_writer = TrajectoryWriter(save_filepath, metadata=metadata, save_images=save_images)
+	
+	if save_np:
+		add_old = False
+		if os.path.isfile(save_np):
+			add_old = True
+			load_existing = dict(np.load(save_np))
+			old_rewards = load_existing['rewards']
+			old_dones = load_existing['dones']
+			old_actions = load_existing['actions']
+			old_lowdim_obs = load_existing['lowdim_obs']
+			old_next_lowdim_obs = load_existing['next_lowdim_obs']
+			old_third_person_img_obs = load_existing['third_person_img_obs']
+			old_next_third_person_img_obs = load_existing['next_third_person_img_obs']
+		
+		rewards = np.zeros([300, 1])
+		dones = np.zeros([300, 1])
+		actions = np.zeros([300, 7])
+		lowdim_obs = np.zeros([300, 7])
+		next_lowdim_obs = np.zeros([300, 7])
+		third_person_img_obs = np.zeros([300, 100, 100, 3])
+		next_third_person_img_obs = np.zeros([300, 100, 100, 3])
 
-    # Reset States #
-    if controller is not None:
-        controller.reset_state()
-    env.camera_reader.set_trajectory_mode()
+	curDof = 6
+	# Prepare For Trajectory #
+	num_steps = 0
+	if reset_robot: 
+		action_info = env.reset(randomize=randomize_reset)
+		cur_img = env.get_images()
 
-    # Prepare Data Writers If Necesary #
-    if save_filepath:
-        traj_writer = TrajectoryWriter(save_filepath, metadata=metadata, save_images=save_images)
-    if recording_folderpath:
-        env.camera_reader.start_recording(recording_folderpath)
+	if policy is None:
+		prev_action = np.zeros(curDof + 1)
+	
+	if measure_error:
+		global_cumul_error = np.empty([0, 6])
+		current_cart_error = np.empty([0, 6])
+		current_joint_error = np.empty([0, 7])
+	
+	# Begin! #
+	end_traj = False
+	monitor_control_frequency = True
 
-    # Prepare For Trajectory #
-    num_steps = 0
-    if reset_robot:
-        env.reset(randomize=randomize_reset)
+	if monitor_control_frequency:
+		min_sleep_left = 1000
+		min_ctrl_freq = 1000
+	
+	cur_time = time_ms()
+	curidx = 0
+	init_time = -1
+	while True:
 
-    # Begin! #
-    while True:
-        # Collect Miscellaneous Info #
-        controller_info = {} if (controller is None) else controller.get_info()
-        skip_action = wait_for_controller and (not controller_info["movement_enabled"])
-        control_timestamps = {"step_start": time_ms()}
+		# Collect Miscellaneous Info #
+		controller_info = {} if (controller is None) else controller.get_info()
+		skip_action = wait_for_controller and (not controller_info['movement_enabled']) 
+		if init_time == -1:
+			init_time = time_ms()
+				
+		# Get Observation #
+		obs = env.get_observation()
+		if obs_pointer is not None: obs_pointer.update(obs)
+		obs['controller_info'] = controller_info
+		obs['timestamp']['skip_action'] = skip_action
 
-        # Get Observation #
-        obs = env.get_observation()
-        if obs_pointer is not None:
-            obs_pointer.update(obs)
-        obs["controller_info"] = controller_info
-        obs["timestamp"]["skip_action"] = skip_action
+		if policy is None: 
+			# smoothen the action
+			xbox_action = controller.get_action()/5
+			smoothed_pos_delta = momentum(xbox_action[:curDof], prev_action[:curDof])
+			action = np.append(smoothed_pos_delta, xbox_action[curDof]) # concatenate with gripper command
+			prev_action = action
+		else: 
+			action = policy.forward(obs)
 
-        # Get Action #
-        control_timestamps["policy_start"] = time_ms()
-        if policy is None:
-            action, controller_action_info = controller.forward(obs, include_info=True)
-        else:
-            action = policy.forward(obs)
-            controller_action_info = {}
+		if save_np:
+			lowdim_obs[curidx][:7] = action_info['lowdim_obs']
+			third_person_img_obs[curidx] = cur_img
 
-        # Regularize Control Frequency #
-        control_timestamps["sleep_start"] = time_ms()
-        comp_time = time_ms() - control_timestamps["step_start"]
-        sleep_left = (1 / env.control_hz) - (comp_time / 1000)
-        if sleep_left > 0:
-            time.sleep(sleep_left)
+		sleep_left = (init_time + 100) - time_ms()
+		init_time += 100
+		comp_time = 1
+		if sleep_left > 0: time.sleep(sleep_left/1000)
 
-        # Moniter Control Frequency #
-        # moniter_control_frequency = True
-        # if moniter_control_frequency:
-        # 	print('Sleep Left: ', sleep_left)
-        # 	print('Feasible Hz: ', (1000 / comp_time))
+		# Monitor Control Frequency #
+		if monitor_control_frequency:
+			if sleep_left < min_sleep_left:
+				min_sleep_left = sleep_left
+			print('Sleep Left: ', sleep_left)
+			print(num_steps)
 
-        # Step Environment #
-        control_timestamps["control_start"] = time_ms()
-        if skip_action:
-            action_info = env.create_action_dict(np.zeros_like(action))
-        else:
-            action_info = env.step(action)
-        action_info.update(controller_action_info)
+		# Step Environment #
+		if skip_action: action_info = env.create_action_dict(np.zeros_like(action))
+		else: action_info, _, _, _ = env.step(action)
+		cur_img = env.get_images()
+		# Save Data #
+		obs['timestamp']['control'] = 0
+		timestep = {'observation': obs, 'action': action_info}
 
-        # Save Data #
-        control_timestamps["step_end"] = time_ms()
-        obs["timestamp"]["control"] = control_timestamps
-        timestep = {"observation": obs, "action": action_info}
-        if save_filepath:
-            traj_writer.write_timestep(timestep)
+		if save_filepath: 
+			traj_writer.write_timestep(timestep)
 
-        # Check Termination #
-        num_steps += 1
-        if horizon is not None:
-            end_traj = horizon == num_steps
-        else:
-            end_traj = controller_info["success"] or controller_info["failure"]
+		if save_np:
+			actions[curidx] = action
+			next_lowdim_obs[curidx][:7] = action_info['lowdim_obs']
+			next_third_person_img_obs[curidx] = cur_img
 
-        # Close Files And Return #
-        if end_traj:
-            if recording_folderpath:
-                env.camera_reader.stop_recording()
-            if save_filepath:
-                traj_writer.close(metadata=controller_info)
-            return controller_info
+		num_steps += 1
+		if num_steps == 300:
+			end_traj = True
+			if save_np:  
+				rewards[curidx] = 1
+				dones[curidx] = 1
+		else:
+			if save_np:
+				rewards[curidx] = 0
+				dones[curidx] = 0
+		
+		# Close Files And Return #
+		if end_traj:
+			endtime = time_ms()
+			finaltime = endtime - cur_time
+			print("FINAL TIME: " + str(finaltime))
+			print("--------------------------------------")
+			print("min sleep left: " + str(min_sleep_left))
+			print("min ctrl freq: " + str(min_ctrl_freq))
+			# if recording_folderpath: env.camera_reader.stop_recording()
+			if save_filepath: 
+				if measure_error:
+					np.save(save_folderpath + "/npcumulerror", global_cumul_error)
+					np.save(save_folderpath + "/npjointerror", current_joint_error)
+					np.save(save_folderpath + "/npcarterror", current_cart_error)
+				traj_writer.close(metadata=controller_info)
+			
+			if save_np:
+				if add_old:
+					actions = np.concatenate([old_actions, actions], axis=0)
+					rewards = np.concatenate([old_rewards, rewards], axis=0)
+					dones = np.concatenate([old_dones, dones], axis=0)
+					lowdim_obs = np.concatenate([old_lowdim_obs, lowdim_obs], axis=0)
+					next_lowdim_obs = np.concatenate([old_next_lowdim_obs, next_lowdim_obs], axis=0)
+					third_person_img_obs = np.concatenate([old_third_person_img_obs, third_person_img_obs], axis=0)
+					next_third_person_img_obs = np.concatenate([old_next_third_person_img_obs, next_third_person_img_obs], axis=0)
+				np.savez(save_np, lowdim_obs=lowdim_obs, next_lowdim_obs=next_lowdim_obs, third_person_img_obs=third_person_img_obs, next_third_person_img_obs=next_third_person_img_obs, actions=actions, rewards=rewards, dones=dones)
+
+			return controller_info
+		curidx += 1
+
+def eval_trajectory(env, controller=None, policy=None, horizon=None, save_folderpath=None,
+		metadata=None, wait_for_controller=False, obs_pointer=None, measure_error=False, save_np=None, save_images=False,
+		recording_folderpath=False, randomize_reset=False, reset_robot=True):
+	'''
+	Collects a robot trajectory.
+	- If policy is None, actions will come from the controller
+	- If a horizon is given, we will step the environment accordingly
+	- Otherwise, we will end the trajectory when the controller tells us to
+	- If you need a pointer to the current observation, pass a dictionary in for obs_pointer
+	- savenp will save a dict like so: ['lowdim_ee', 'actions', 'rewards', 'dones']
+	'''
+
+	# Check Parameters #
+	assert (controller is not None) or (policy is not None)
+	assert (controller is not None) or (horizon is not None)
+	# assert (measure_error == (save_folderpath is not None))
+	if wait_for_controller: assert (controller is not None)
+	if obs_pointer is not None: assert isinstance(obs_pointer, dict)
+	if save_folderpath is not None:
+		save_filepath = save_folderpath + '/trajectory.h5'
+	else:
+		save_filepath = None
+	if save_images: assert save_filepath is not None
+
+	# Prepare For Trajectory #
+	num_steps = 0
+	if reset_robot: 
+		ts_obs = env.reset()
+
+	curDof = 6
+	if policy is None:
+		prev_action = np.zeros(curDof + 1)
+	
+	# Begin! #
+	end_traj = False
+	monitor_control_frequency = True
+	if monitor_control_frequency:
+		min_sleep_left = 1000
+		min_ctrl_freq = 1000
+
+	cur_time = time_ms()
+	curidx = 0
+	init_time = -1
+	while True:
+		# Collect Miscellaneous Info #
+		control_timestamps = {'step_start': time_ms()}
+		if init_time == -1:
+			init_time = time_ms()
+		
+		# time.sleep(0.065)
+		# Get Action #
+		control_timestamps['policy_start'] = time_ms()
+		if policy is None: 
+			# smoothen the action
+			xbox_action = controller.get_action()/5
+			smoothed_pos_delta = momentum(xbox_action[:curDof], prev_action[:curDof])
+			action = np.append(smoothed_pos_delta, xbox_action[curDof]) # concatenate with gripper command
+			prev_action = action
+		else: 
+			action = policy.act(ts_obs.observation, uniform_action=False, eval_mode=True)
+
+		# Regularize Control Frequency #
+		sleep_left = (init_time + 100) - time_ms()
+		init_time += 100
+		comp_time = 1
+		if sleep_left > 0: time.sleep(sleep_left/1000)
+
+		# Monitor Control Frequency #
+		if monitor_control_frequency:
+			if sleep_left < min_sleep_left:
+				min_sleep_left = sleep_left
+			print('Sleep Left: ', sleep_left)
+			print(num_steps)
+
+		# Step Environment #
+		ts_obs = env.step(action)
+
+		num_steps += 1
+		if num_steps == 300:
+			end_traj = True
+
+		# Close Files And Return #
+		if end_traj:
+			endtime = time_ms()
+			finaltime = endtime - cur_time
+			print("FINAL WALLCLOCK TIME: " + str(finaltime))
+			print("--------------------------------------")
+			print("min sleep left: " + str(min_sleep_left))
+			print("min ctrl freq: " + str(min_ctrl_freq))
+			exit()
 
 
 def calibrate_camera(
