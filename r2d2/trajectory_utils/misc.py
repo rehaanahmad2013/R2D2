@@ -116,7 +116,7 @@ def collect_trajectory(env, controller=None, policy=None, horizon=None, save_fol
 			action = policy.forward(obs)
 
 		if save_np:
-			lowdim_obs[curidx][:7] = action_info['lowdim_obs']
+			lowdim_obs[curidx][:7] = action_info['state']
 			third_person_img_obs[curidx] = cur_img
 
 		sleep_left = (init_time + 100) - time_ms()
@@ -144,7 +144,7 @@ def collect_trajectory(env, controller=None, policy=None, horizon=None, save_fol
 
 		if save_np:
 			actions[curidx] = action
-			next_lowdim_obs[curidx][:7] = action_info['lowdim_obs']
+			next_lowdim_obs[curidx][:7] = action_info['state']
 			next_third_person_img_obs[curidx] = cur_img
 
 		num_steps += 1
